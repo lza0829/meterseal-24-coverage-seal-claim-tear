@@ -2,7 +2,6 @@ from __future__ import annotations
 import hashlib
 import uuid
 from datetime import datetime, timezone
-from app.services import coverage_view
 
 from fastapi import HTTPException
 
@@ -128,21 +127,32 @@ def seal_period(period_id: str, batch_id: str | None = None) -> dict:
             (batch_id,),
         ).fetchone()["c"]
 
-        # 覆盖率闸：与预设扫描、快照、总览、缺失表同一口径。
+        # 覆盖率闸：闸门、快照、批头、未抄列表、总览共用「正式键重放」。
         gate = coverage.evaluate_seal_gate(conn, period_id)
         if not gate["ok"]:
             raise HTTPException(
                 409,
                 {
-                    "code": "coverage_gate_blocked",
+                    "code": coverage.CODE_GATE_BLOCKED,
                     "message": gate["reason"],
                     "architecture": gate["policy"]["architecture"],
                     "threshold": gate["policy"]["threshold"],
                     "stale": gate["stale"],
+                    "claim_mismatch": gate["claim_mismatch"],
                     "precheck": gate["precheck"],
                 },
             )
-        snapshot = coverage.coverage_snapshot(conn, period_id)
+        try:
+            snapshot = coverage.coverage_snapshot(conn, period_id)
+        except coverage.CoverageTear as exc:
+            # 覆盖宣告与正式键证据撕裂：事务回滚，账期保持开放，未抄列表不动。
+            raise HTTPException(
+                409,
+                {
+                    "code": coverage.CODE_CLAIM_TEAR,
+                    "message": f"覆盖率宣告与正式键集合分叉，拒封：{exc}",
+                },
+            ) from exc
         if not snapshot["gate_ok"]:
             # 闸门通过后快照必须同口径；否则视为内部口径分叉，宁可拒封。
             raise HTTPException(500, "覆盖率口径分叉，拒封")
@@ -156,6 +166,10 @@ def seal_period(period_id: str, batch_id: str | None = None) -> dict:
             and snapshot["gate_ok"]
         ):
             raise HTTPException(500, "覆盖率不足不得写达标快照")
+        # 批头与快照同事务写同一份重放证据；批头覆盖率必须能由正式键重放。
+        if snapshot["precheck_id"] is not None and gate["precheck"] is not None:
+            if snapshot["precheck_id"] != gate["precheck"]["precheck_id"]:
+                raise HTTPException(500, "封印批头预检与闸门预检不一致，拒封")
 
         sealed_at = _now()
         conn.execute(
@@ -179,8 +193,22 @@ def seal_period(period_id: str, batch_id: str | None = None) -> dict:
             ),
         )
         conn.execute(
-            "UPDATE reconcile_batches SET status='sealed' WHERE batch_id=?",
-            (batch_id,),
+            """UPDATE reconcile_batches SET status='sealed',
+                   coverage_architecture=?, coverage_state=?, coverage_ratio=?,
+                   coverage_threshold=?, coverage_method=?, coverage_missing=?,
+                   coverage_precheck_id=?, coverage_data_fingerprint=?
+               WHERE batch_id=?""",
+            (
+                snapshot["architecture"],
+                snapshot["state"],
+                snapshot["ratio"],
+                snapshot["threshold"],
+                snapshot["method"],
+                ",".join(snapshot["missing_meters"]),
+                snapshot["precheck_id"],
+                snapshot["data_fingerprint"],
+                batch_id,
+            ),
         )
         conn.execute(
             "UPDATE coverage_prechecks SET status='sealed' "

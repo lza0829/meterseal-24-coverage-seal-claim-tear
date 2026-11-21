@@ -638,3 +638,301 @@ def test_legacy_db_without_coverage_columns_migrates(tmp_path, monkeypatch):
     with TestClient(fastapi_app) as c:
         policy = c.get("/api/coverage/policy").json()
         assert policy == {"architecture": "hard_gate", "threshold": 0.8}
+
+
+# ---------------------------------------------------------------- claim tear fixtures
+#
+# 四条链必须同源于「正式实抄键 ∪ 应对齐键集合」的重放：
+#   预检 → 批头 → 总览 → 未抄列表。
+# 下面四个夹具分别钉住用户列出的撕裂场景。
+
+
+def _chain_snapshot(c, period=PERIOD):
+    """一次取齐四条链的覆盖声明，便于断言它们不分叉。"""
+    return {
+        "scan": c.get("/api/coverage/scan", params={"period_id": period}).json(),
+        "missing": c.get("/api/coverage/missing", params={"period_id": period}).json(),
+        "overview": c.get("/api/overview").json()["coverage"],
+        "gate": c.get("/api/coverage/gate", params={"period_id": period}).json(),
+    }
+
+
+def _sealed_chain(c, period=PERIOD):
+    snap = c.get("/api/coverage/snapshot", params={"period_id": period}).json()
+    period_row = next(p for p in c.get("/api/periods").json() if p["period_id"] == period)
+    batch = c.get("/api/batches", params={"period_id": period}).json()[0]
+    missing = c.get("/api/coverage/missing", params={"period_id": period}).json()
+    overview = c.get("/api/overview").json()["coverage"]
+    return {"snapshot": snap, "period": period_row, "batch": batch,
+            "missing": missing, "overview": overview}
+
+
+def test_chain_all_four_links_agree_before_seal(client):
+    delete_actuals(client, ["M-E-202", "M-W-201"])
+    set_policy(client, "hard_gate", 0.9)
+    pc = precheck(client).json()
+    ch = _chain_snapshot(client)
+    for link in ("scan", "missing"):
+        assert ch[link]["covered_key_count"] == pc["covered_key_count"] == 4
+        assert ch[link]["estimate_key_count"] == 6
+        assert ch[link]["missing_meters"] == pc["missing_meters"] == ["M-E-202", "M-W-201"]
+        assert ch[link]["coverage_ratio"] == pc["coverage_ratio"] == pytest.approx(4 / 6)
+    assert ch["overview"]["coverage_ratio"] == pytest.approx(4 / 6)
+    assert ch["overview"]["missing_meters"] == ["M-E-202", "M-W-201"]
+    assert ch["gate"]["ok"] is False
+    # 覆盖率不是 100% 且未抄列表非空：数字与键集合一致。
+    assert ch["scan"]["key_evidence"]["missing_keys"] == ["M-E-202", "M-W-201"]
+
+
+def test_fixture_high_precheck_full_header_missing_list_not_empty(client):
+    """夹具 1：预检 95% / 批头 100% / 未抄仍有行 —— 必须收口，禁止数字绿键集合分叉。"""
+    set_policy(client, "hard_gate", 0.9)
+    delete_actuals(client, ["M-W-201"])  # 5/6 = 83.3% < 0.9
+    pc = precheck(client).json()
+    assert pc["verdict"] == "fail"
+    client.post("/api/align", json={"period_id": PERIOD})
+    r = seal(client)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "coverage_gate_blocked"
+    # 未封印：未抄列表仍有行，且 100% 从未出现。
+    ch = _chain_snapshot(client)
+    assert ch["missing"]["missing_meters"] == ["M-W-201"]
+    assert ch["scan"]["coverage_ratio"] == pytest.approx(5 / 6)
+    assert ch["overview"]["coverage_ratio"] == pytest.approx(5 / 6)
+    assert ch["overview"]["verdict"] == "fail"
+
+
+def test_fixture_seal_clears_list_without_actuals_is_refused(client):
+    """夹具 2：封印试图清空未抄列表但没有正式实抄 —— 正式键重放不足，回滚假封印。"""
+    set_policy(client, "hard_gate", 0.8)
+    delete_actuals(client, ["M-E-202", "M-W-201"])
+    precheck(client)
+    client.post("/api/align", json={"period_id": PERIOD})
+    assert seal(client).status_code == 409
+    period = next(p for p in client.get("/api/periods").json() if p["period_id"] == PERIOD)
+    assert period["status"] == "open"
+    assert period["coverage_state"] is None
+    # 未抄列表未被清空：仍能由正式键重放。
+    data = client.get("/api/coverage/missing", params={"period_id": PERIOD}).json()
+    assert data["missing_meters"] == ["M-E-202", "M-W-201"]
+
+
+def test_fixture_sealed_missing_list_replayable_from_formal_keys(client):
+    """正式键架构：封印后未抄列表必须能由正式键原样重放。"""
+    delete_actuals(client, ["M-E-202"])
+    set_policy(client, "allow_skip", 0.8)
+    precheck(client)
+    client.post("/api/align", json={"period_id": PERIOD})
+    r = seal(client)
+    assert r.status_code == 200, r.text
+    ch = _sealed_chain(client)
+    snap = ch["snapshot"]
+    assert snap["missing_meters"] == ["M-E-202"]
+    assert ch["missing"]["missing_meters"] == snap["missing_meters"]
+    assert ch["missing"]["claim_tear"] is False
+    assert ch["overview"]["missing_meters"] == snap["missing_meters"]
+    assert ch["overview"]["claim_tear"] is False
+    # 批头与快照同事务写，字段一致。
+    assert ch["batch"]["coverage_state"] == snap["state"]
+    assert ch["batch"]["coverage_ratio"] == snap["coverage_ratio"]
+    assert ch["batch"]["coverage_missing"] == "M-E-202"
+    assert ch["batch"]["coverage_precheck_id"] == snap["precheck_id"]
+    assert ch["batch"]["coverage_data_fingerprint"] == snap["data_fingerprint"]
+
+
+def test_fixture_interleaved_old_snapshot_never_becomes_current(client):
+    """夹具 3：预检与封印交错 —— 装载先落库则旧预检过期，封印不得按旧快照落批。"""
+    set_policy(client, "hard_gate", 0.9)
+    assert precheck(client).json()["verdict"] == "pass"
+    client.post("/api/align", json={"period_id": PERIOD})
+
+    # 交错：封印前又装载了一条新估抄（新表无实抄），覆盖率降到 6/7 < 0.9。
+    import sqlite3
+
+    conn = sqlite3.connect(client.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO meters(meter_id,building,unit_label,meter_type,status) "
+            "VALUES ('M-W-998','C栋','998','water','active')"
+        )
+        conn.execute(
+            "INSERT INTO estimates(estimate_id,meter_id,period_id,qty,doc_no,loaded_at) "
+            "VALUES ('E-LATE','M-W-998',?,3.0,'EST-LATE','2026-10-31T08:00:00')",
+            (PERIOD,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 闸门看的必须是新装载后的正式键，而不是封印前那套 100% 旧快照。
+    gate = client.get("/api/coverage/gate", params={"period_id": PERIOD}).json()
+    assert gate["ok"] is False
+    assert gate["stale"] is True
+    r = seal(client)
+    assert r.status_code == 409
+    assert r.json()["detail"]["stale"] is True
+    period = next(p for p in client.get("/api/periods").json() if p["period_id"] == PERIOD)
+    assert period["status"] == "open"
+    assert period["coverage_ratio"] is None
+
+
+def test_fixture_concurrent_double_precheck_leaves_single_claim(client):
+    """夹具 4：并发双预检只能留下一条 active 覆盖声明。"""
+    import sqlite3
+    import threading
+
+    barrier = threading.Barrier(6)
+    ids: list[str] = []
+
+    def do_precheck():
+        barrier.wait()
+        r = precheck(client)
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["precheck_id"])
+
+    threads = [threading.Thread(target=do_precheck) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert len(ids) == 6
+    conn = sqlite3.connect(client.db_path)
+    try:
+        active = conn.execute(
+            "SELECT precheck_id FROM coverage_prechecks WHERE period_id=? AND status='active'",
+            (PERIOD,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(active) == 1, active
+    # 接口读到的 active 预检就是那唯一一条。
+    latest = client.get("/api/coverage/scan", params={"period_id": PERIOD}).json()["active_precheck"]
+    assert latest["precheck_id"] == active[0][0]
+
+
+def test_fixture_forged_full_coverage_header_is_torn_not_green(client):
+    """伪造高覆盖预检：数字绿、键集合不足 → 撕裂拒封，不许只改缓存糊过去。"""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    set_policy(client, "hard_gate", 0.8)
+    delete_actuals(client, ["M-E-202", "M-W-201"])
+    client.post("/api/align", json={"period_id": PERIOD})
+
+    conn = sqlite3.connect(client.db_path)
+    try:
+        # 伪造一条与数据无关的 pass 预检：6/6、满覆盖、未抄为空。
+        conn.execute(
+            """INSERT INTO coverage_prechecks(
+                 precheck_id, period_id, architecture, method,
+                 estimate_key_count, covered_key_count, coverage_ratio, threshold,
+                 missing_meters, data_fingerprint, verdict, status, created_at)
+               VALUES ('PC-painted', ?, 'hard_gate', 'meter_keys',
+                       6, 6, 1.0, 0.8, '', 'deadbeefdeadbeef', 'pass', 'active', ?)""",
+            (PERIOD, datetime.now(timezone.utc).replace(microsecond=0).isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 未抄列表仍由正式键重放给出，绝不被伪造批头清空。
+    data = client.get("/api/coverage/missing", params={"period_id": PERIOD}).json()
+    assert data["missing_meters"] == ["M-E-202", "M-W-201"]
+    gate = client.get("/api/coverage/gate", params={"period_id": PERIOD}).json()
+    assert gate["ok"] is False
+    assert gate["claim_mismatch"] is True
+    r = seal(client)
+    assert r.status_code == 409
+    assert r.json()["detail"]["claim_mismatch"] is True
+    period = next(p for p in client.get("/api/periods").json() if p["period_id"] == PERIOD)
+    assert period["status"] == "open"
+    assert period["coverage_ratio"] is None
+
+
+def test_health_has_no_paint_bypass(client):
+    """旧的粉饰缓存口径已移除：health 不再回报任何覆盖率数字。"""
+    set_policy(client, "hard_gate", 0.9)
+    delete_actuals(client, ["M-E-202", "M-W-201"])
+    precheck(client)
+    health = client.get("/api/health").json()
+    assert health["ok"] is True
+    assert "coverage_ratio" not in health
+    assert "coverage_missing" not in health
+    # 覆盖率只以正式键重放为准。
+    ov = client.get("/api/overview").json()["coverage"]
+    assert ov["coverage_ratio"] == pytest.approx(4 / 6)
+
+
+def test_paint_setting_write_is_rejected(client):
+    r = client.put("/api/settings/coverage_paint", json={"value": '{"ratio": 1.0}'})
+    assert r.status_code == 400
+
+
+def test_ratio_100_iff_missing_empty_invariant(client):
+    """覆盖率 100% 当且仅当未抄列表为空 —— 对每个中间状态都成立。"""
+    delete_actuals(client, ALL_METERS)
+    for i, mid in enumerate(ALL_METERS):
+        add_actual(client, mid, doc_no=f"INV-{mid}")
+        data = client.get("/api/coverage/missing", params={"period_id": PERIOD}).json()
+        if data["missing_count"] == 0:
+            assert data["coverage_ratio"] == 1.0
+        else:
+            assert data["coverage_ratio"] < 1.0
+
+
+def test_legacy_paint_cache_is_purged_and_duplicate_active_collapsed(tmp_path, monkeypatch):
+    """旧库遗留的粉饰缓存与多套 active 预检：启动迁移后只留一套正式键声明。"""
+    import sqlite3
+
+    from app.seed import SCHEMA, _migrate
+
+    db = tmp_path / "legacy_paint.db"
+    monkeypatch.setenv("METERS_DB_PATH", str(db))
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.executescript(SCHEMA)
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES ('coverage_paint',"
+            "'{\"ratio\": 1.0, \"missing\": []}')"
+        )
+        conn.execute(
+            "INSERT INTO periods(period_id,status) VALUES ('2026-10','open')"
+        )
+        conn.execute(
+            "INSERT INTO settings(key,value) VALUES ('current_period','2026-10')"
+        )
+        for pid, created in (("PC-a", "2026-11-01T00:00:00"), ("PC-b", "2026-11-02T00:00:00")):
+            conn.execute(
+                """INSERT INTO coverage_prechecks(
+                     precheck_id, period_id, architecture, method,
+                     estimate_key_count, covered_key_count, coverage_ratio, threshold,
+                     missing_meters, data_fingerprint, verdict, status, created_at)
+                   VALUES (?, '2026-10', 'hard_gate', 'meter_keys', 6, 6, 1.0, 0.8,
+                           '', 'fp', 'pass', 'active', ?)""",
+                (pid, created),
+            )
+        conn.commit()
+        _migrate(conn)
+        conn.commit()
+
+        assert not conn.execute(
+            "SELECT 1 FROM settings WHERE key='coverage_paint'"
+        ).fetchone()
+        active = conn.execute(
+            "SELECT precheck_id FROM coverage_prechecks WHERE status='active'"
+        ).fetchall()
+        assert [r["precheck_id"] for r in active] == ["PC-b"], active
+        batch_cols = {r["name"] for r in conn.execute("PRAGMA table_info(reconcile_batches)")}
+        assert "coverage_state" in batch_cols and "coverage_missing" in batch_cols
+    finally:
+        conn.close()
+
+    from app.main import app as _app
+
+    with TestClient(_app) as c:
+        # 旧粉饰缓存的 100% 不会出现在任何覆盖链路上。
+        ov = c.get("/api/overview").json()["coverage"]
+        assert ov["coverage_ratio"] is None  # 无估抄/实抄：无分母
+        assert ov["missing_meters"] == []

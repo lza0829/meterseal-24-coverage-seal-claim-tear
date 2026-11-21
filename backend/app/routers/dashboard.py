@@ -3,17 +3,23 @@ from fastapi import APIRouter
 from app.db import connect
 from app.services import coverage
 from app.services.gate import get_setting
-from app.services import coverage_view
 
 router = APIRouter(tags=["dashboard"])
 
 
 @router.get("/health")
 def health():
-    paint = coverage_view.read_paint(conn)
-        return {
-            "coverage_ratio": paint.get("ratio"),
-            "coverage_missing": paint.get("missing", []),"ok": True, "product": "抄表簿"}
+    """健康检查只报存活；覆盖率一律从正式键重放读，不再有粉饰缓存旁路。"""
+    conn = connect()
+    try:
+        policy = coverage.get_policy(conn)
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "product": "抄表簿",
+        "coverage_architecture": policy.architecture,
+    }
 
 
 def _period_coverage_summary(conn, period_id: str | None, policy) -> dict | None:
@@ -24,7 +30,13 @@ def _period_coverage_summary(conn, period_id: str | None, policy) -> dict | None
     ).fetchone()
     if not row:
         return None
+    replay = coverage.replay_coverage(conn, period_id, policy)
     if row["status"] == "sealed":
+        stored_missing = [m for m in (row["coverage_missing"] or "").split(",") if m]
+        tear = (
+            row["coverage_data_fingerprint"] != replay.data_fingerprint
+            or set(stored_missing) != set(replay.missing_meters)
+        )
         ratio = row["coverage_ratio"]
         return {
             "period_id": period_id,
@@ -34,25 +46,29 @@ def _period_coverage_summary(conn, period_id: str | None, policy) -> dict | None
             "coverage_ratio": ratio,
             "coverage_percent": None if ratio is None else round(ratio * 100, 2),
             "threshold": row["coverage_threshold"],
-            "missing_meters": [
-                m for m in (row["coverage_missing"] or "").split(",") if m
-            ],
+            "missing_meters": stored_missing,
+            "replay_missing_meters": list(replay.missing_meters),
+            "claim_tear": tear,
+            "estimate_key_count": replay.estimate_key_count,
+            "covered_key_count": replay.covered_key_count,
             "precheck_id": row["coverage_precheck_id"],
             "data_fingerprint": row["coverage_data_fingerprint"],
+            "replay_fingerprint": replay.data_fingerprint,
             "gate_ok": True,
+            "key_evidence": replay.key_evidence(),
         }
-    result = coverage.compute_coverage(conn, period_id, policy)
     active = coverage.latest_active_precheck(conn, period_id)
     stale = (
         None
         if active is None
-        else coverage.precheck_is_stale(active, result.data_fingerprint, policy)
+        else coverage.precheck_is_stale(active, replay.data_fingerprint, policy)
+        or not coverage.precheck_matches_replay(active, replay)
     )
     gate = coverage.evaluate_seal_gate(conn, period_id)
     return {
         "period_id": period_id,
         "period_status": row["status"],
-        **result.as_dict(policy),
+        **replay.as_dict(policy),
         "active_precheck": active,
         "active_precheck_stale": stale,
         "gate_ok": gate["ok"],

@@ -58,10 +58,11 @@ onMounted(load)
       <div class="stat">覆盖率<b>{{ 覆盖比(scan.coverage_ratio) }}</b></div>
       <div class="stat">判定<b>{{ 标(覆盖状态, scan.verdict) }}</b></div>
       <div class="stat">缺失表<b>{{ scan.missing_count }}</b></div>
+      <div class="stat">实抄独有键<b>{{ scan.key_evidence?.actual_only_keys?.length || 0 }}</b></div>
       <div class="stat">预检状态<b>{{ scan.active_precheck ? 标(预检状态, scan.active_precheck.status) : '无' }}</b></div>
     </div>
     <p class="msg" v-if="scan && scan.active_precheck_stale === true">
-      数据或口径已变动，当前有效预检已过期，封印前需重新扫描。
+      数据或口径已变动，当前有效预检已过期（或与正式键重放不一致），封印前需重新扫描。
     </p>
 
     <div class="panel" v-if="scan">
@@ -109,6 +110,7 @@ onMounted(load)
           <tr><th>绑定预检</th><td>{{ snapshot.precheck_id || '—' }}</td></tr>
           <tr><th>数据指纹</th><td>{{ snapshot.data_fingerprint || '—' }}</td></tr>
           <tr v-if="!snapshot.sealed"><th>可封</th><td>{{ snapshot.gate_ok ? '是' : '否：' + (snapshot.gate_reason || '') }}</td></tr>
+          <tr v-if="!snapshot.sealed && snapshot.claim_mismatch"><th>证据撕裂</th><td>预检数字与正式键重放不一致，须重扫</td></tr>
         </tbody>
       </table>
     </div>

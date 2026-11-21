@@ -73,10 +73,35 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS coverage_claim_repairs (
+  repair_id TEXT PRIMARY KEY,
+  period_id TEXT NOT NULL,
+  detected_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  stored_state TEXT,
+  stored_ratio REAL,
+  stored_missing TEXT,
+  stored_fingerprint TEXT,
+  replay_ratio REAL,
+  replay_missing TEXT NOT NULL,
+  replay_fingerprint TEXT NOT NULL
+);
 """
 
 # 旧库补列：封印快照与预检绑定。缺失即补，重复启动安全。
 PERIOD_COVERAGE_COLUMNS = {
+    "coverage_architecture": "TEXT",
+    "coverage_state": "TEXT",
+    "coverage_ratio": "REAL",
+    "coverage_threshold": "REAL",
+    "coverage_method": "TEXT",
+    "coverage_missing": "TEXT",
+    "coverage_precheck_id": "TEXT",
+    "coverage_data_fingerprint": "TEXT",
+}
+
+# 封印批头也记录覆盖口径：批头与账期快照同事务写、同正式键重放校验。
+BATCH_COVERAGE_COLUMNS = {
     "coverage_architecture": "TEXT",
     "coverage_state": "TEXT",
     "coverage_ratio": "REAL",
@@ -92,20 +117,39 @@ DEFAULT_SETTINGS = {
     "coverage_threshold": "0.8",
 }
 
+# 同一账期最多一条 active 预检：并发双预检不会留下两套覆盖声明。
+ACTIVE_PRECHECK_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_coverage_prechecks_active
+    ON coverage_prechecks(period_id) WHERE status='active'
+"""
+
+
+def _ensure_columns(conn, table: str, columns: dict[str, str]) -> None:
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, sql_type in columns.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+
 
 def _migrate(conn) -> None:
-    cols = {
-        r["name"]
-        for r in conn.execute("PRAGMA table_info(periods)").fetchall()
-    }
-    for name, sql_type in PERIOD_COVERAGE_COLUMNS.items():
-        if name not in cols:
-            conn.execute(f"ALTER TABLE periods ADD COLUMN {name} {sql_type}")
+    _ensure_columns(conn, "periods", PERIOD_COVERAGE_COLUMNS)
+    _ensure_columns(conn, "reconcile_batches", BATCH_COVERAGE_COLUMNS)
     for key, value in DEFAULT_SETTINGS.items():
         conn.execute(
             "INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING",
             (key, value),
         )
+    # 旁路粉饰缓存（coverage_paint）不得再作为覆盖口径来源。
+    conn.execute("DELETE FROM settings WHERE key='coverage_paint'")
+    # 旧库若已留下多条 active，先收口到最新一条，再建唯一索引。
+    conn.execute(
+        """UPDATE coverage_prechecks SET status='superseded'
+           WHERE status='active' AND rowid NOT IN (
+               SELECT MAX(rowid) FROM coverage_prechecks
+               WHERE status='active' GROUP BY period_id
+           )"""
+    )
+    conn.executescript(ACTIVE_PRECHECK_INDEX)
 
 
 def seed_if_empty() -> None:

@@ -35,6 +35,10 @@ onMounted(async () => {
       <p class="msg" v-if="data.coverage.active_precheck_stale === true">
         当前预检已过期，请重新扫描覆盖率。
       </p>
+      <p class="msg err" v-if="data.coverage.claim_tear">
+        封印快照的覆盖清单与正式实抄键集合重放不一致；总览以正式键重放为准，缺失见
+        <router-link to="/coverage/missing">缺失表清单</router-link>。
+      </p>
       <p class="msg" v-if="data.coverage.missing_meters.length">
         缺失：{{ data.coverage.missing_meters.join('、') }}
         <router-link to="/coverage/missing">（清单）</router-link>

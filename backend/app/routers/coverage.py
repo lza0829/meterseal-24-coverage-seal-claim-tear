@@ -1,7 +1,6 @@
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from app.services import coverage_view
 
 from app.db import connect, transaction
 from app.services import coverage
@@ -34,28 +33,29 @@ def get_policy():
 
 @router.put("/coverage/policy")
 def put_policy(body: PolicyIn):
-    # 口径切换后旧预检因架构不符自动失效，封印前必须重扫。
+    # 口径切换后旧预检因架构/阈值不符自动失效，封印前必须重扫。
     return coverage.save_policy(body.architecture, body.threshold)
 
 
 @router.get("/coverage/scan")
 def scan(period_id: str, persist: bool = False):
-    """覆盖率扫描：实抄表键数 / 估抄表键数；persist=true 时物化为预检批。"""
+    """覆盖率扫描：正式实抄表键 / 估抄表键；persist=true 时物化为预检批。"""
     if persist:
         with transaction() as conn:
-            _require_period(conn, period_id)
-            precheck = coverage.run_precheck(conn, period_id)
-            return precheck
+            if _require_period(conn, period_id)["status"] == "sealed":
+                raise HTTPException(409, "账期已封印，无需预检")
+            return coverage.run_precheck(conn, period_id)
     conn = connect()
     try:
         period = _require_period(conn, period_id)
         policy = coverage.get_policy(conn)
-        result = coverage.compute_coverage(conn, period_id, policy)
+        result = coverage.replay_coverage(conn, period_id, policy)
         active = coverage.latest_active_precheck(conn, period_id)
         stale = (
             None
             if active is None
             else coverage.precheck_is_stale(active, result.data_fingerprint, policy)
+            or not coverage.precheck_matches_replay(active, result)
         )
         return {
             **result.as_dict(policy),
@@ -105,49 +105,59 @@ def precheck_detail(precheck_id: str):
 
 @router.get("/coverage/missing")
 def missing(period_id: str):
-    """缺失表清单：应抄未抄（有估抄无实抄）的表，附当前预检与过期状态。
+    """未抄列表：应抄未抄（有估抄无实抄）的表。
 
-    已封印账期直接读封印快照留存的清单，避免封印后数据再变导致页面与快照分叉。
+    未封印：按正式键重放实时给出，并附当前预检与过期状态；
+    已封印：读封印快照留存的清单，并与正式键重放核对，撕裂则如实标记
+    ``claim_tear``，绝不悄悄抹平。
     """
     conn = connect()
     try:
         period = _require_period(conn, period_id)
         policy = coverage.get_policy(conn)
+        replay = coverage.replay_coverage(conn, period_id, policy)
         if period["status"] == "sealed":
-            snap_ratio = period["coverage_ratio"]
-            missing_meters = [
+            stored_missing = [
                 m for m in (period["coverage_missing"] or "").split(",") if m
             ]
+            tear = (
+                period["coverage_data_fingerprint"] != replay.data_fingerprint
+                or set(stored_missing) != set(replay.missing_meters)
+            )
+            snap_ratio = period["coverage_ratio"]
             return {
                 "architecture": period["coverage_architecture"] or policy.architecture,
                 "threshold": period["coverage_threshold"],
-                "estimate_key_count": None,
-                "covered_key_count": None,
+                "estimate_key_count": replay.estimate_key_count,
+                "covered_key_count": replay.covered_key_count,
                 "coverage_ratio": snap_ratio,
                 "coverage_percent": (
                     None if snap_ratio is None else round(snap_ratio * 100, 2)
                 ),
-                "missing_meters": missing_meters,
-                "missing_count": len(missing_meters),
-                "meets_threshold": None,
+                "missing_meters": stored_missing,
+                "missing_count": len(stored_missing),
+                "replay_missing_meters": list(replay.missing_meters),
+                "claim_tear": tear,
+                "meets_threshold": replay.meets_threshold,
                 "verdict": period["coverage_state"],
                 "data_fingerprint": period["coverage_data_fingerprint"],
+                "replay_fingerprint": replay.data_fingerprint,
                 "period_status": "sealed",
-                "rows": _missing_rows(conn, missing_meters),
+                "rows": _missing_rows(conn, stored_missing),
                 "active_precheck": None,
                 "active_precheck_stale": None,
             }
-        result = coverage.compute_coverage(conn, period_id, policy)
         active = coverage.latest_active_precheck(conn, period_id)
         stale = (
             None
             if active is None
-            else coverage.precheck_is_stale(active, result.data_fingerprint, policy)
+            else coverage.precheck_is_stale(active, replay.data_fingerprint, policy)
+            or not coverage.precheck_matches_replay(active, replay)
         )
         return {
-            **result.as_dict(policy),
+            **replay.as_dict(policy),
             "period_status": period["status"],
-            "rows": _missing_rows(conn, result.missing_meters),
+            "rows": _missing_rows(conn, replay.missing_meters),
             "active_precheck": active,
             "active_precheck_stale": stale,
         }
@@ -226,6 +236,7 @@ def snapshot(period_id: str):
             "data_fingerprint": snap["data_fingerprint"],
             "gate_ok": snap["gate_ok"],
             "gate_reason": snap["gate_reason"],
+            "claim_mismatch": snap["claim_mismatch"],
         }
     finally:
         conn.close()
@@ -237,14 +248,5 @@ def gate(period_id: str):
     try:
         _require_period(conn, period_id)
         return coverage.evaluate_seal_gate(conn, period_id)
-    finally:
-        conn.close()
-
-
-@router.get("/painted")
-def painted():
-    conn = connect()
-    try:
-        return coverage_view.read_paint(conn)
     finally:
         conn.close()
